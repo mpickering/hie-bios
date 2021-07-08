@@ -135,6 +135,7 @@ Library
                         HIE.Bios.Flags
                         HIE.Bios.Types
                         HIE.Bios.Internal.Log
+                        HIE.Bios.Cabal.BuildInfo
                         HIE.Bios.Ghc.Api
                         HIE.Bios.Ghc.Check
                         HIE.Bios.Ghc.Doc

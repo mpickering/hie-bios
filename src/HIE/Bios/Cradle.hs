@@ -2,6 +2,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 module HIE.Bios.Cradle (
       findCradle
     , loadCradle
@@ -53,6 +55,7 @@ import System.IO
 import Control.DeepSeq
 
 import Data.Conduit.Process
+import Data.List.NonEmpty (NonEmpty((:|)))
 import qualified Data.Conduit.Combinators as C
 import qualified Data.Conduit as C
 import qualified Data.Conduit.Text as C
@@ -61,6 +64,8 @@ import qualified Data.HashMap.Strict as Map
 import           Data.Maybe (fromMaybe, maybeToList)
 import           GHC.Fingerprint (fingerprintString)
 import DynFlags (dynamicGhc)
+import Data.Version
+import HIE.Bios.Cabal.BuildInfo
 
 hie_bios_output :: String
 hie_bios_output = "HIE_BIOS_OUTPUT"
@@ -130,14 +135,16 @@ addCradleDeps deps c =
     addActionDeps ca =
       ca { runCradle = \l fp ->
             runCradle ca l fp
-              >>= \case
-                CradleSuccess (ComponentOptions os' dir ds) ->
-                  pure $ CradleSuccess (ComponentOptions os' dir (ds `union` deps))
-                CradleFail err ->
-                  pure $ CradleFail
-                    (err { cradleErrorDependencies = cradleErrorDependencies err `union` deps })
-                CradleNone -> pure CradleNone
+              >>= pure . addStaticDeps
          }
+
+    addStaticDeps :: CradleLoadResult (NonEmpty ComponentOptions) -> CradleLoadResult (NonEmpty  ComponentOptions)
+    addStaticDeps (CradleSuccess ops) = CradleSuccess (fmap addDepsToOpts ops)
+    addStaticDeps (CradleFail err) = CradleFail (err { cradleErrorDependencies = cradleErrorDependencies err `union` deps })
+    addStaticDeps CradleNone = CradleNone
+
+    addDepsToOpts :: ComponentOptions -> ComponentOptions
+    addDepsToOpts (ComponentOptions os' dir ds) = (ComponentOptions os' dir (ds `union` deps))
 
 -- | Try to infer an appropriate implicit cradle type from stuff we can find in the enclosing directories:
 --   * If a .hie-bios file is found, we can treat this as a @Bios@ cradle
@@ -247,7 +254,7 @@ defaultCradle cur_dir =
     , cradleOptsProg = CradleAction
         { actionName = Types.Default
         , runCradle = \_ _ ->
-            return (CradleSuccess (ComponentOptions argDynamic cur_dir []))
+            return (CradleSuccess (ComponentOptions argDynamic cur_dir []:| []) )
         , runGhcCmd = runGhcCmdOnPath cur_dir
         }
     }
@@ -317,7 +324,7 @@ multiAction ::  forall b a
             -> [(FilePath, CradleConfig b)]
             -> LoggingFunction
             -> FilePath
-            -> IO (CradleLoadResult ComponentOptions)
+            -> IO (CradleLoadResult (NonEmpty ComponentOptions))
 multiAction buildCustomCradle cur_dir cs l cur_fp =
     selectCradle =<< canonicalizeCradles
 
@@ -356,7 +363,7 @@ directCradle wdir args =
     , cradleOptsProg = CradleAction
         { actionName = Types.Direct
         , runCradle = \_ _ ->
-            return (CradleSuccess (ComponentOptions (args ++ argDynamic) wdir []))
+            return $ CradleSuccess (ComponentOptions (args ++ argDynamic) wdir [] :| [])
         , runGhcCmd = runGhcCmdOnPath wdir
         }
     }
@@ -394,7 +401,7 @@ biosAction :: FilePath
            -> Maybe Callable
            -> LoggingFunction
            -> FilePath
-           -> IO (CradleLoadResult ComponentOptions)
+           -> IO (CradleLoadResult (NonEmpty ComponentOptions))
 biosAction wdir bios bios_deps l fp = do
   bios' <- callableToProcess bios (Just fp)
   (ex, _stdo, std, [(_, res),(_, mb_deps)]) <-
@@ -520,33 +527,53 @@ cabalBuildDir work_dir = do
   let dirHash = show (fingerprintString abs_work_dir)
   getCacheDir ("dist-"<>filter (not . isSpace) (takeBaseName abs_work_dir)<>"-"<>dirHash)
 
-cabalAction :: FilePath -> Maybe String -> LoggingFunction -> FilePath -> IO (CradleLoadResult ComponentOptions)
+getCabalVersion :: IO Version
+getCabalVersion = (makeVersion . map (read . T.unpack) . T.splitOn "." . T.pack) <$> readProcess "cabal" ["--numeric-version"] ""
+
+cabalAction :: FilePath -> Maybe String -> LoggingFunction -> FilePath -> IO (CradleLoadResult (NonEmpty ComponentOptions))
 cabalAction work_dir mc l fp = do
-    wrapper_fp <- withCabalWrapperTool ("ghc", []) work_dir
+    ver <- getCabalVersion
     buildDir <- cabalBuildDir work_dir
-    let cab_args = ["--builddir="<>buildDir,"v2-repl", "--with-compiler", wrapper_fp, fromMaybe (fixTargetPath fp) mc]
-    (ex, output, stde, [(_,mb_args)]) <-
-      readProcessWithOutputs [hie_bios_output] l work_dir (proc "cabal" cab_args)
-    let args = fromMaybe [] mb_args
-    case processCabalWrapperArgs args of
-        Nothing -> do
-          -- Best effort. Assume the working directory is the
-          -- the root of the component, so we are right in trivial cases at least.
-          deps <- cabalCradleDependencies work_dir work_dir
-          pure $ CradleFail (CradleError deps ex
-                    ["Failed to parse result of calling cabal"
-                     , unlines output
-                     , unlines stde
-                     , unlines $ args])
-        Just (componentDir, final_args) -> do
-          deps <- cabalCradleDependencies work_dir componentDir
-          pure $ makeCradleResult (ex, stde, componentDir, final_args) deps
-  where
-    -- Need to make relative on Windows, due to a Cabal bug with how it
-    -- parses file targets with a C: drive in it
-    fixTargetPath x
-      | isWindows && hasDrive x = makeRelative work_dir x
-      | otherwise = x
+    if ver > makeVersion [3, 4]
+      then do
+        (ex, output, stde, []) <- readProcessWithOutputs [] l work_dir (proc "cabal" ["show-build-info", "--buildinfo-json-output", "info.json", "all"])
+        res <- decodeBuildInfoFile "info.json"
+        pure $ case components res of
+          [] -> CradleNone
+          (x:xs) -> CradleSuccess (infoToOptions x :| fmap infoToOptions xs)
+      else do
+        wrapper_fp <- withCabalWrapperTool ("ghc", []) work_dir
+        let cab_args = ["--builddir="<>buildDir,"v2-repl", "--with-compiler", wrapper_fp, fromMaybe (fixTargetPath fp) mc]
+        (ex, output, stde, [(_,mb_args)]) <-
+          readProcessWithOutputs [hie_bios_output] l work_dir (proc "cabal" cab_args)
+        let args = fromMaybe [] mb_args
+        case processCabalWrapperArgs args of
+            Nothing -> do
+              -- Best effort. Assume the working directory is the
+              -- the root of the component, so we are right in trivial cases at least.
+              deps <- cabalCradleDependencies work_dir work_dir
+              pure $ CradleFail (CradleError deps ex
+                        ["Failed to parse result of calling cabal"
+                        , unlines output
+                        , unlines stde
+                        , unlines $ args])
+            Just (componentDir, final_args) -> do
+              deps <- cabalCradleDependencies work_dir componentDir
+              pure $ makeCradleResult (ex, stde, componentDir, final_args) deps
+      where
+        -- Need to make relative on Windows, due to a Cabal bug with how it
+        -- parses file targets with a C: drive in it
+        fixTargetPath x
+          | isWindows && hasDrive x = makeRelative work_dir x
+          | otherwise = x
+
+infoToOptions :: ComponentInfo -> ComponentOptions
+infoToOptions ComponentInfo {..} =
+    ComponentOptions
+      { componentRoot = componentSrcDir
+      , componentDependencies = maybeToList componentCabalFile
+      , componentOptions = componentCompilerArgs ++ componentModules ++ componentSrcFiles
+      }
 
 removeInteractive :: [String] -> [String]
 removeInteractive = filter (/= "--interactive")
@@ -649,7 +676,7 @@ stackCradleDependencies wdir componentDir syaml = do
   return $ map normalise $
     cabalFiles ++ [relFp </> "package.yaml", stackYamlLocationOrDefault syaml]
 
-stackAction :: FilePath -> Maybe String -> StackYaml -> LoggingFunction -> FilePath -> IO (CradleLoadResult ComponentOptions)
+stackAction :: FilePath -> Maybe String -> StackYaml -> LoggingFunction -> FilePath -> IO (CradleLoadResult (NonEmpty ComponentOptions))
 stackAction work_dir mc syaml l _fp = do
   let ghcProcArgs = ("stack", stackYamlProcessArgs syaml <> ["exec", "ghc", "--"])
   -- Same wrapper works as with cabal
@@ -876,13 +903,13 @@ removeFileIfExists f = do
   yes <- doesFileExist f
   when yes (removeFile f)
 
-makeCradleResult :: (ExitCode, [String], FilePath, [String]) -> [FilePath] -> CradleLoadResult ComponentOptions
+makeCradleResult :: (ExitCode, [String], FilePath, [String]) -> [FilePath] -> CradleLoadResult (NonEmpty ComponentOptions)
 makeCradleResult (ex, err, componentDir, gopts) deps =
   case ex of
     ExitFailure _ -> CradleFail (CradleError deps ex err)
     _ ->
         let compOpts = ComponentOptions gopts componentDir deps
-        in CradleSuccess compOpts
+        in CradleSuccess (compOpts :| [])
 
 -- | Calls @ghc --print-libdir@, with just whatever's on the PATH.
 runGhcCmdOnPath :: FilePath -> [String] -> IO (CradleLoadResult String)
