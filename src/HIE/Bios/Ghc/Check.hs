@@ -19,6 +19,9 @@ import qualified HIE.Bios.Ghc.Gap as Gap
 
 import qualified DynFlags as G
 import qualified GHC as G
+import qualified Data.List.NonEmpty as NE
+import Control.Monad (forM)
+import Control.Monad.Extra (concatForM)
 
 ----------------------------------------------------------------
 
@@ -28,19 +31,19 @@ checkSyntax :: Show a
             => Cradle a
             -> [FilePath]  -- ^ The target files.
             -> IO String
-checkSyntax _      []    = return ""
+checkSyntax _      []    = return []
 checkSyntax cradle files = do
     libDirRes <- getRuntimeGhcLibDir cradle
     handleRes libDirRes $ \libDir ->
       G.runGhcT (Just libDir) $ do
         Log.debugm $ "Cradle: " ++ show cradle
         res <- initializeFlagsWithCradle (head files) cradle
-        handleRes res $ \(ini, _) -> do
+        handleRes res $ \comps -> concatForM (NE.toList comps) $ \(ini, _) -> do
           _sf <- ini
           either id id <$> check files
   where
     handleRes (CradleSuccess x) f = f x
-    handleRes (CradleFail ce) _f = liftIO $ throwIO ce 
+    handleRes (CradleFail ce) _f = liftIO $ throwIO ce
     handleRes CradleNone _f = return "None cradle"
 
 ----------------------------------------------------------------
