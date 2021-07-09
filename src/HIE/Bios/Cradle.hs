@@ -538,9 +538,9 @@ cabalAction work_dir mc l fp = do
       then do
         (ex, output, stde, []) <- readProcessWithOutputs [] l work_dir (proc "cabal" ["show-build-info", "--buildinfo-json-output", "info.json", "all"])
         res <- decodeBuildInfoFile "info.json"
-        pure $ case components res of
-          [] -> CradleNone
-          (x:xs) -> CradleSuccess (infoToOptions x :| fmap infoToOptions xs)
+        case components res of
+          [] -> pure CradleNone
+          (x:xs) -> fmap CradleSuccess $ sequenceA (infoToOptions x :| fmap infoToOptions xs)
       else do
         wrapper_fp <- withCabalWrapperTool ("ghc", []) work_dir
         let cab_args = ["--builddir="<>buildDir,"v2-repl", "--with-compiler", wrapper_fp, fromMaybe (fixTargetPath fp) mc]
@@ -567,13 +567,23 @@ cabalAction work_dir mc l fp = do
           | isWindows && hasDrive x = makeRelative work_dir x
           | otherwise = x
 
-infoToOptions :: ComponentInfo -> ComponentOptions
-infoToOptions ComponentInfo {..} =
-    ComponentOptions
+infoToOptions :: ComponentInfo -> IO ComponentOptions
+infoToOptions ComponentInfo {..} = do
+    sourceFiles <- guessSourceFiles componentSrcFiles
+    pure $ ComponentOptions
       { componentRoot = componentSrcDir
       , componentDependencies = maybeToList componentCabalFile
-      , componentOptions = componentCompilerArgs ++ componentModules ++ componentSrcFiles
+      , componentOptions = componentCompilerArgs ++ componentModules ++ sourceFiles
       }
+    where
+      -- | Output from 'cabal show-build-info' doesn't tell us the full path for source files.
+      -- Guess the full path here.
+      guessSourceFiles s
+        | [l] <- componentHsSrcDirs = pure $ fmap (l </>) s
+        | otherwise = do
+            let candidates = [ dir </> src | src <- s, dir <- componentHsSrcDirs]
+            filterM doesFileExist candidates
+
 
 removeInteractive :: [String] -> [String]
 removeInteractive = filter (/= "--interactive")
